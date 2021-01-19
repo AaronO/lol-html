@@ -1,115 +1,127 @@
+use super::comment::Comment;
+use super::doctype::Doctype;
+use super::document_end::DocumentEnd;
+use super::element::Element;
+use super::text_chunk::TextChunk;
 use super::*;
-use js_sys::{Function as JsFunction, Reflect};
-use lol_html::{DocumentContentHandlers, ElementContentHandlers, Selector};
+use js_sys::Function as JsFunction;
+use lol_html::{
+    DocumentContentHandlers as NativeDocumentContentHandlers,
+    ElementContentHandlers as NativeElementContentHandlers, Selector,
+};
 use std::borrow::Cow;
+use std::mem;
+use thiserror::Error;
 
-// JsHandlers represents a collection of JS callbacks
-#[derive(Clone)]
-struct JsHandlers(JsValue);
-impl JsHandlers {
-    fn new(obj: JsValue) -> Self {
-        JsHandlers(obj.clone())
-    }
+// NOTE: Display is noop, because we'll unwrap JSValue error when it will be propagated to
+// `write()` or `end()`.
+#[derive(Error, Debug)]
+#[error("JS handler error")]
+pub struct HandlerJsErrorWrap(pub String);
 
-    fn method(&mut self, method: &str) -> JsFunction {
-        Reflect::get(&self.0, &JsValue::from_str(method))
-            .map(|v| JsFunction::from(v))
-            .unwrap()
-    }
+macro_rules! make_handler {
+    ($handler:ident, $JsArgType:ident) => {
+        move |arg: &mut _| {
+            let (js_arg, anchor) = $JsArgType::from_native(arg);
+            let this = JsValue::NULL;
+            let js_arg = JsValue::from(js_arg);
 
-    fn has(&mut self, method: &str) -> bool {
-        Reflect::has(&self.0, &JsValue::from_str(method)).unwrap()
-    }
-}
+            let res = match $handler.call1(&this, &js_arg) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(HandlerJsErrorWrap(e.as_string().unwrap()).into()),
+            };
 
-// A macro to reduce verbosity in building conditional handlers
-macro_rules! build_handler {
-    ($h: ident, $hx: ident, $method_name:literal, $builder_name:ident, $ty:ty) => {
-        if $h.has($method_name) {
-            let m = $h.method($method_name);
-            $hx = $hx.$builder_name(move |x| {
-                m.call1(&JsValue::NULL, &<$ty>::from_native(x).0.into())
-                    .unwrap();
-                Ok(())
-            });
+            mem::drop(anchor);
+
+            res
         }
     };
 }
 
+macro_rules! add_handler {
+    ($builder: ident, $jsObj:ident, $method:ident, $JsArgType:ident) => {
+        if let Some(handler) = $jsObj.$method() {
+            $builder = $builder.$method(make_handler!(handler, $JsArgType));
+        }
+    };
+}
+
+#[wasm_bindgen]
+extern "C" {
+    pub type ElementContentHandlers;
+
+    #[wasm_bindgen(method, getter)]
+    fn element(this: &ElementContentHandlers) -> Option<JsFunction>;
+    #[wasm_bindgen(method, getter)]
+    fn comments(this: &ElementContentHandlers) -> Option<JsFunction>;
+    #[wasm_bindgen(method, getter)]
+    fn text(this: &ElementContentHandlers) -> Option<JsFunction>;
+}
+
+impl IntoNative<NativeElementContentHandlers<'static>> for ElementContentHandlers {
+    fn into_native(self) -> NativeElementContentHandlers<'static> {
+        let mut native = NativeElementContentHandlers::default();
+
+        add_handler!(native, self, element, Element);
+        add_handler!(native, self, comments, Comment);
+        add_handler!(native, self, text, TextChunk);
+
+        native
+    }
+}
+
+#[wasm_bindgen]
+extern "C" {
+    pub type DocumentContentHandlers;
+
+    #[wasm_bindgen(method, getter)]
+    fn doctype(this: &DocumentContentHandlers) -> Option<JsFunction>;
+    #[wasm_bindgen(method, getter)]
+    fn comments(this: &DocumentContentHandlers) -> Option<JsFunction>;
+    #[wasm_bindgen(method, getter)]
+    fn text(this: &DocumentContentHandlers) -> Option<JsFunction>;
+    #[wasm_bindgen(method, getter)]
+    fn end(this: &DocumentContentHandlers) -> Option<JsFunction>;
+}
+
+impl IntoNative<NativeDocumentContentHandlers<'static>> for DocumentContentHandlers {
+    fn into_native(self) -> NativeDocumentContentHandlers<'static> {
+        let mut native = NativeDocumentContentHandlers::default();
+
+        add_handler!(native, self, doctype, Doctype);
+        add_handler!(native, self, comments, Comment);
+        add_handler!(native, self, text, TextChunk);
+        add_handler!(native, self, end, DocumentEnd);
+
+        native
+    }
+}
+
 // Element handlers
-pub(crate) struct JsElHandlers(pub(crate) Vec<(String, JsValue)>);
-type NativeElHandlers<'a> = Vec<(Cow<'a, Selector>, ElementContentHandlers<'a>)>;
-impl JsElHandlers {
-    pub fn into_native<'a>(&self) -> NativeElHandlers<'a> {
+#[derive(Clone)]
+pub(crate) struct VecElHandlers(pub(crate) Vec<(String, JsValue)>);
+impl VecElHandlers {
+    pub fn into_native<'a>(self) -> Vec<(Cow<'a, Selector>, NativeElementContentHandlers<'a>)> {
         self.0
-            .iter()
+            .into_iter()
             .map(|(selector, h)| {
                 (
                     Cow::Owned(selector.parse().unwrap()),
-                    Self::single_native((*h).clone()),
+                    ElementContentHandlers::from(h).into_native(),
                 )
             })
             .collect()
     }
-
-    fn single_native<'a>(obj: JsValue) -> ElementContentHandlers<'a> {
-        let mut h = JsHandlers::new(obj);
-        let mut hx = ElementContentHandlers::default();
-
-        build_handler!(h, hx, "element", element, element::Element);
-        build_handler!(h, hx, "comments", comments, comment::Comment);
-        build_handler!(h, hx, "text", text, text_chunk::TextChunk);
-
-        hx
-    }
 }
 
 // Doc handlers
-pub(crate) struct JsDocHandlers(pub(crate) Vec<JsValue>);
-type NativeDocHandlers<'a> = Vec<DocumentContentHandlers<'a>>;
-impl JsDocHandlers {
-    pub fn into_native<'a>(&self) -> NativeDocHandlers<'a> {
+#[derive(Clone)]
+pub(crate) struct VecDocHandlers(pub(crate) Vec<JsValue>);
+impl VecDocHandlers {
+    pub fn into_native<'a>(self) -> Vec<NativeDocumentContentHandlers<'a>> {
         self.0
-            .iter()
-            .map(|h| (Self::single_native((*h).clone())))
+            .into_iter()
+            .map(|h| DocumentContentHandlers::from(h).into_native())
             .collect()
     }
-
-    fn single_native<'a>(obj: JsValue) -> DocumentContentHandlers<'a> {
-        let mut h = JsHandlers::new(obj);
-        let mut hx = DocumentContentHandlers::default();
-
-        build_handler!(h, hx, "comments", comments, comment::Comment);
-        build_handler!(h, hx, "text", text, text_chunk::TextChunk);
-        build_handler!(h, hx, "end", end, document_end::DocumentEnd);
-        build_handler!(h, hx, "doctype", doctype, doctype::Doctype);
-
-        hx
-    }
 }
-
-// #[wasm_bindgen]
-// extern "C" {
-//     pub type ExternElementHandlers;
-
-//     #[wasm_bindgen(structural, method)]
-//     pub fn element(this: &ExternElementHandlers, el: Element);
-//     #[wasm_bindgen(structural, method)]
-//     pub fn text(this: &ExternElementHandlers, text: TextChunk);
-//     #[wasm_bindgen(structural, method)]
-//     pub fn comments(this: &ExternElementHandlers, comment: Comment);
-// }
-
-// #[wasm_bindgen]
-// extern "C" {
-//     pub type ExternDocumentHandlers;
-
-//     #[wasm_bindgen(structural, method)]
-//     pub fn doctype(this: &ExternDocumentHandlers, doctype: doctype::Doctype);
-//     #[wasm_bindgen(structural, method)]
-//     pub fn text(this: &ExternDocumentHandlers, text: text_chunk::TextChunk);
-//     #[wasm_bindgen(structural, method)]
-//     pub fn comments(this: &ExternDocumentHandlers, comment: comment::Comment);
-//     #[wasm_bindgen(structural, method)]
-//     pub fn end(this: &ExternDocumentHandlers, end: document_end::DocumentEnd);
-// }

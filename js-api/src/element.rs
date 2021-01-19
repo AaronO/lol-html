@@ -41,7 +41,7 @@ impl Element {
         self.0.get().map(|e| e.namespace_uri().into())
     }
 
-    #[wasm_bindgen(method, getter=attributes)]
+    #[wasm_bindgen(method, getter)]
     pub fn attributes(&self) -> JsResult<JsValue> {
         self.0
             .get()

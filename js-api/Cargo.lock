@@ -181,6 +181,7 @@ dependencies = [
  "lol_html",
  "serde",
  "serde-wasm-bindgen",
+ "thiserror",
  "wasm-bindgen",
  "web-sys",
 ]
